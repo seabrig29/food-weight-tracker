@@ -1,5 +1,5 @@
 const vaultStorageKey = 'food-weight-tracker-v1';
-const hostedVaultUrl = 'https://www.folkbandura.com/private/food-tracker-vault%20%281%29.enc';
+const hostedVaultUrl = 'https://www.folkbandura.com/private/food-tracker-sync.php';
 const vaultStatus = document.querySelector('#vaultStatus');
 const toBase64 = bytes => btoa(String.fromCharCode(...bytes));
 const fromBase64 = text => Uint8Array.from(atob(text), char => char.charCodeAt(0));
@@ -23,6 +23,17 @@ function downloadVault(contents) {
   link.click();
   link.remove();
   setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
+async function createVaultText(passphrase) {
+  const data = localStorage.getItem(vaultStorageKey);
+  if (passphrase.length < 6) throw new Error('Use a vault passphrase of at least 6 characters.');
+  if (!data) throw new Error('There is no tracker data to encrypt yet.');
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await vaultKey(passphrase, salt);
+  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(data));
+  return JSON.stringify({ version: 1, kdf: 'PBKDF2-SHA-256', iterations: 250000, salt: toBase64(salt), iv: toBase64(iv), ciphertext: toBase64(new Uint8Array(ciphertext)) });
 }
 
 async function decryptVaultText(text, passphrase) {
@@ -71,25 +82,34 @@ async function restoreVaultText(text, passphrase, successMessage) {
 
 document.querySelector('#createVault').addEventListener('click', async () => {
   const passphrase = document.querySelector('#vaultPassphrase').value;
-  const data = localStorage.getItem(vaultStorageKey);
-  if (passphrase.length < 6) {
-    vaultStatus.textContent = 'Use a passphrase of at least 6 characters.';
-    return;
-  }
-  if (!data) {
-    vaultStatus.textContent = 'There is no tracker data to encrypt yet.';
-    return;
-  }
   try {
-    const salt = crypto.getRandomValues(new Uint8Array(16));
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    const key = await vaultKey(passphrase, salt);
-    const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(data));
-    downloadVault(JSON.stringify({ version: 1, kdf: 'PBKDF2-SHA-256', iterations: 250000, salt: toBase64(salt), iv: toBase64(iv), ciphertext: toBase64(new Uint8Array(ciphertext)) }));
+    downloadVault(await createVaultText(passphrase));
     vaultStatus.textContent = 'Encrypted vault downloaded. Store it somewhere private, then upload that .enc file to your domain when ready.';
     document.querySelector('#vaultPassphrase').value = '';
   } catch {
     vaultStatus.textContent = 'Could not create the encrypted vault. Please try again.';
+  }
+});
+
+document.querySelector('#saveHostedVault').addEventListener('click', async () => {
+  const vaultPassphrase = document.querySelector('#vaultPassphrase').value;
+  const syncPassphrase = document.querySelector('#syncPassphrase').value;
+  if (!syncPassphrase) {
+    vaultStatus.textContent = 'Enter the sync password first.';
+    return;
+  }
+  vaultStatus.textContent = 'Encrypting and saving your current history…';
+  try {
+    const response = await fetch(hostedVaultUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Food-Tracker-Sync-Key': syncPassphrase },
+      body: await createVaultText(vaultPassphrase),
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.error || `Could not save the cloud history (status ${response.status}).`);
+    vaultStatus.textContent = 'Current history encrypted and saved to the cloud. You can now load it on your other device.';
+  } catch (error) {
+    vaultStatus.textContent = error.message || 'Could not save the cloud history.';
   }
 });
 
@@ -109,15 +129,19 @@ document.querySelector('#restoreVault').addEventListener('click', async () => {
 
 document.querySelector('#restoreHostedVault').addEventListener('click', async () => {
   const passphrase = document.querySelector('#vaultPassphrase').value;
-  if (!passphrase) {
-    vaultStatus.textContent = 'Enter your vault passphrase first.';
+  const syncPassphrase = document.querySelector('#syncPassphrase').value;
+  if (!passphrase || !syncPassphrase) {
+    vaultStatus.textContent = 'Enter both the vault passphrase and sync password first.';
     return;
   }
   vaultStatus.textContent = 'Downloading encrypted vault…';
   try {
-    const response = await fetch(hostedVaultUrl, { cache: 'no-store' });
-    if (!response.ok) throw new Error(`The hosted vault could not be downloaded (status ${response.status}).`);
-    await restoreVaultText(await response.text(), passphrase, 'Hosted vault unlocked successfully. Your tracker data is now loaded on this device.');
+    const response = await fetch(hostedVaultUrl, { cache: 'no-store', headers: { 'X-Food-Tracker-Sync-Key': syncPassphrase } });
+    if (!response.ok) {
+      const result = await response.json().catch(() => ({}));
+      throw new Error(result.error || `The cloud history could not be downloaded (status ${response.status}).`);
+    }
+    await restoreVaultText(await response.text(), passphrase, 'Cloud history loaded successfully on this device.');
   } catch (error) {
     vaultStatus.textContent = error.message || 'Could not unlock the hosted vault.';
   }
